@@ -126,6 +126,34 @@ The Apache Polaris build currently requires Java 21 or later. There are a few to
 * [SDKMAN!](https://sdkman.io/) follow the installation instructions, then run `sdk list java` to see the available distributions and versions, then run `sdk install java <identifier from list>` using the identifier for the distribution and version (>= 21) of your choice.
 * [jenv](https://www.jenv.be/) If on a Mac you can use jenv to set the appropriate SDK.
 
+## AI Assistant and Copilot Usage
+
+When using GitHub Copilot or other AI coding assistants in conversations about this repository,
+all tool calls and automated actions must remain scoped to **`machov/polaris`** (or the upstream
+`apache/polaris` project). Conversations about Polaris should never trigger tool actions—such as
+opening pull requests or issues—in unrelated repositories.
+
+### Understanding Copilot tool/task links
+
+A Copilot coding agent may generate a **task link** that looks like:
+
+```
+https://github.com/copilot/tasks/pull/<task-id>
+```
+
+This link represents an agent task (for example, a PR it has been asked to create). If such a
+link appears referencing a repository other than this one, it was produced by a different
+workflow context and **should be disregarded**. It does not affect the current repository.
+
+If you encounter an unexpected task link or a tool-approval prompt for an unrelated repository
+in a Polaris conversation:
+1. **Do not accept the prompt** — reject or ignore it.
+2. Clarify with the agent that the action targets the wrong repository.
+3. The agent should abandon the stray task and continue the discussion scoped to this repository.
+
+See [`.github/copilot-instructions.md`](.github/copilot-instructions.md) for the full Copilot
+configuration instructions that enforce this scoping.
+
 ## Code Contribution Guidelines
 
 To ensure smooth collaboration and to maintain a high-quality codebase, please adhere to the following guidelines when make code contributions:

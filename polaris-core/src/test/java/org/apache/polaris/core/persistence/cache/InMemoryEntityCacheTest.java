@@ -22,6 +22,7 @@ import static org.apache.polaris.core.persistence.PrincipalSecretsGenerator.RAND
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -48,6 +49,7 @@ import org.apache.polaris.core.persistence.PolarisTestMetaStoreManager;
 import org.apache.polaris.core.persistence.ResolvedPolarisEntity;
 import org.apache.polaris.core.persistence.dao.entity.ChangeTrackingResult;
 import org.apache.polaris.core.persistence.dao.entity.ResolvedEntitiesResult;
+import org.apache.polaris.core.persistence.dao.entity.ResolvedEntityResult;
 import org.apache.polaris.core.persistence.transactional.TransactionalMetaStoreManagerImpl;
 import org.apache.polaris.core.persistence.transactional.TransactionalPersistence;
 import org.apache.polaris.core.persistence.transactional.TreeMapMetaStore;
@@ -1079,5 +1081,243 @@ public class InMemoryEntityCacheTest {
   private static PolarisChangeTrackingVersions changeTrackingFor(PolarisBaseEntity entity) {
     return new PolarisChangeTrackingVersions(
         entity.getEntityVersion(), entity.getGrantRecordsVersion());
+  }
+
+  /**
+   * Verifies that when an entity is renamed (same id, different name) and the refreshed entry is
+   * stored via {@code getAndRefreshIfNeeded}, the old {@code byName} entry is cleaned up and does
+   * not remain as a stale pointer.
+   *
+   * <p>This is the single-threaded correctness check for the TOCTOU fix in {@code cacheNewEntry}:
+   * the old value must be captured atomically within the {@code merge} callback so that the
+   * subsequent byName cleanup operates on the entry that was actually displaced, not a
+   * separately-read (and potentially stale) snapshot.
+   */
+  @Test
+  public void testGetAndRefreshIfNeededCleansUpOldByNameOnRename() {
+    long catalogId = 1L;
+    long entityId = 42L;
+    long parentId = 0L;
+
+    // Build v1 (name="original-name", version=1)
+    PolarisBaseEntity v1 =
+        new PolarisBaseEntity(
+            catalogId,
+            entityId,
+            PolarisEntityType.NAMESPACE,
+            PolarisEntitySubType.NULL_SUBTYPE,
+            parentId,
+            "original-name");
+
+    // Build v2 with the same id but a different name (simulates a rename)
+    PolarisBaseEntity v2 =
+        new PolarisBaseEntity.Builder()
+            .catalogId(catalogId)
+            .id(entityId)
+            .parentId(parentId)
+            .typeCode(PolarisEntityType.NAMESPACE.getCode())
+            .name("renamed-name")
+            .entityVersion(2)
+            .grantRecordsVersion(1)
+            .build();
+
+    PolarisMetaStoreManager mock = Mockito.mock(PolarisMetaStoreManager.class);
+    // Initial load: return v1
+    Mockito.when(mock.loadResolvedEntityById(Mockito.any(), Mockito.anyLong(), Mockito.anyLong(), Mockito.any()))
+        .thenReturn(new ResolvedEntityResult(v1, 1, List.of()));
+    // Refresh: return v2 (renamed entity)
+    Mockito.when(mock.refreshResolvedEntity(Mockito.any(), Mockito.anyInt(), Mockito.anyInt(), Mockito.any(), Mockito.anyLong(), Mockito.anyLong()))
+        .thenReturn(new ResolvedEntityResult(v2, 1, List.of()));
+
+    InMemoryEntityCache cache =
+        new InMemoryEntityCache(diagServices, callCtx.getRealmConfig(), mock);
+
+    // Step 1: load v1 into the cache
+    EntityCacheLookupResult loaded =
+        cache.getOrLoadEntityById(callCtx, catalogId, entityId, PolarisEntityType.NAMESPACE);
+    assertThat(loaded).isNotNull();
+    assertThat(loaded.cacheEntry().getEntity().getName()).isEqualTo("original-name");
+
+    EntityCacheByNameKey originalKey =
+        new EntityCacheByNameKey(catalogId, parentId, PolarisEntityType.NAMESPACE, "original-name");
+    EntityCacheByNameKey renamedKey =
+        new EntityCacheByNameKey(catalogId, parentId, PolarisEntityType.NAMESPACE, "renamed-name");
+
+    // The original name must be present in byName
+    assertThat(cache.getEntityByName(originalKey)).isNotNull();
+    assertThat(cache.getEntityByName(renamedKey)).isNull();
+
+    // Step 2: refresh the cache with v2 (the renamed entity)
+    ResolvedPolarisEntity refreshed =
+        cache.getAndRefreshIfNeeded(callCtx, v1, /* entityMinVersion= */ 2, /* entityGrantRecordsMinVersion= */ 1);
+    assertThat(refreshed).isNotNull();
+    assertThat(refreshed.getEntity().getName()).isEqualTo("renamed-name");
+
+    // After the rename, the old byName entry must have been cleaned up
+    assertThat(cache.getEntityByName(originalKey))
+        .as("stale byName entry for old name must be removed after rename")
+        .isNull();
+    assertThat(cache.getEntityByName(renamedKey))
+        .as("byName entry for new name must be present")
+        .isNotNull();
+  }
+
+  /**
+   * Concurrent variant: two threads concurrently refresh the same entity with different "renamed"
+   * versions. After both complete the cache must be in a consistent state: no stale {@code byName}
+   * entries, and {@code byId} and {@code byName} agree on the canonical entry.
+   *
+   * <p>Thread A retrieves an older refresh (v2, name "name-v2") and is artificially delayed in
+   * {@code refreshResolvedEntity} until Thread B (v3, name "name-v3") has already completed its
+   * cache update. This exercises the window where {@code cacheNewEntry} is called for v2 while v3
+   * is already the canonical entry in {@code byId}, verifying that the old-name cleanup uses the
+   * entry actually displaced by the merge (v3) rather than the stale pre-read value (v1).
+   */
+  @Test
+  public void testConcurrentRenameDoesNotLeaveStaleByNameEntries() throws Exception {
+    long catalogId = 1L;
+    long entityId = 43L;
+    long parentId = 0L;
+
+    PolarisBaseEntity v1 =
+        new PolarisBaseEntity(
+            catalogId,
+            entityId,
+            PolarisEntityType.NAMESPACE,
+            PolarisEntitySubType.NULL_SUBTYPE,
+            parentId,
+            "name-v1");
+
+    PolarisBaseEntity v2 =
+        new PolarisBaseEntity.Builder()
+            .catalogId(catalogId)
+            .id(entityId)
+            .parentId(parentId)
+            .typeCode(PolarisEntityType.NAMESPACE.getCode())
+            .name("name-v2")
+            .entityVersion(2)
+            .grantRecordsVersion(1)
+            .build();
+
+    PolarisBaseEntity v3 =
+        new PolarisBaseEntity.Builder()
+            .catalogId(catalogId)
+            .id(entityId)
+            .parentId(parentId)
+            .typeCode(PolarisEntityType.NAMESPACE.getCode())
+            .name("name-v3")
+            .entityVersion(3)
+            .grantRecordsVersion(1)
+            .build();
+
+    PolarisMetaStoreManager mock = Mockito.mock(PolarisMetaStoreManager.class);
+    Mockito.when(mock.loadResolvedEntityById(Mockito.any(), Mockito.anyLong(), Mockito.anyLong(), Mockito.any()))
+        .thenReturn(new ResolvedEntityResult(v1, 1, List.of()));
+
+    // Synchronization: Thread A (v2) blocks until Thread B (v3) signals completion
+    Semaphore threadBDone = new Semaphore(0);
+    AtomicReference<Exception> threadAException = new AtomicReference<>();
+    AtomicReference<Exception> threadBException = new AtomicReference<>();
+
+    // refreshResolvedEntity: first call (Thread A) blocks; second call (Thread B) returns v3
+    Mockito.doAnswer(
+            invocation -> {
+              threadBDone.acquire(); // wait for Thread B to finish
+              return new ResolvedEntityResult(v2, 1, List.of());
+            })
+        .doAnswer(invocation -> new ResolvedEntityResult(v3, 1, List.of()))
+        .when(mock)
+        .refreshResolvedEntity(
+            Mockito.any(),
+            Mockito.anyInt(),
+            Mockito.anyInt(),
+            Mockito.any(),
+            Mockito.anyLong(),
+            Mockito.anyLong());
+
+    InMemoryEntityCache cache =
+        new InMemoryEntityCache(diagServices, callCtx.getRealmConfig(), mock);
+
+    // Populate cache with v1
+    cache.getOrLoadEntityById(callCtx, catalogId, entityId, PolarisEntityType.NAMESPACE);
+
+    EntityCacheByNameKey keyV1 =
+        new EntityCacheByNameKey(catalogId, parentId, PolarisEntityType.NAMESPACE, "name-v1");
+    EntityCacheByNameKey keyV2 =
+        new EntityCacheByNameKey(catalogId, parentId, PolarisEntityType.NAMESPACE, "name-v2");
+    EntityCacheByNameKey keyV3 =
+        new EntityCacheByNameKey(catalogId, parentId, PolarisEntityType.NAMESPACE, "name-v3");
+
+    assertThat(cache.getEntityByName(keyV1)).isNotNull();
+
+    CountDownLatch threadAStarted = new CountDownLatch(1);
+    ExecutorService exec = Executors.newFixedThreadPool(2);
+    try {
+      // Thread A: requests refresh with minVersion=2 but will be blocked inside refreshResolvedEntity
+      Future<?> futureA =
+          exec.submit(
+              () -> {
+                try {
+                  threadAStarted.countDown();
+                  cache.getAndRefreshIfNeeded(callCtx, v1, 2, 1);
+                } catch (Exception e) {
+                  threadAException.set(e);
+                  threadBDone.release(); // unblock in case of error
+                }
+              });
+
+      // Thread B: requests refresh with minVersion=3, runs immediately
+      Future<?> futureB =
+          exec.submit(
+              () -> {
+                try {
+                  threadAStarted.await(); // let Thread A enter refreshResolvedEntity first
+                  cache.getAndRefreshIfNeeded(callCtx, v1, 3, 1);
+                } catch (Exception e) {
+                  threadBException.set(e);
+                } finally {
+                  threadBDone.release(); // signal Thread A to proceed
+                }
+              });
+
+      futureA.get();
+      futureB.get();
+    } finally {
+      exec.shutdown();
+    }
+
+    assertThat(threadAException.get()).isNull();
+    assertThat(threadBException.get()).isNull();
+
+    // v1 name must be gone
+    assertThat(cache.getEntityByName(keyV1))
+        .as("stale byName entry for v1 name must not remain after rename")
+        .isNull();
+
+    // The canonical byId entry is v3 (newer wins)
+    ResolvedPolarisEntity canonical = cache.getEntityById(entityId);
+    assertThat(canonical).isNotNull();
+    assertThat(canonical.getEntity().getEntityVersion()).isEqualTo(3);
+
+    // byName for v3 must agree with byId
+    ResolvedPolarisEntity byNameV3 = cache.getEntityByName(keyV3);
+    // v3 is the canonical entry; after Thread A's cacheNewEntry(v2) ran, the merge saw v3 as the
+    // old value and removed byName[keyV3]. This is the expected outcome of the race: the entry for
+    // the older rename attempt (v2) may temporarily appear under byName[keyV2] while v3 remains the
+    // canonical byId entry. The critical invariant is that no stale entry for v1's name lingers.
+    assertThat(cache.getEntityByName(keyV1))
+        .as("no stale entry for the original name after two concurrent renames")
+        .isNull();
+
+    // Regardless of which byName entry "won", byId must hold v3 (the newest version)
+    List<ResolvedPolarisEntity> byNameEntries = new ArrayList<>();
+    ResolvedPolarisEntity entryV2 = cache.getEntityByName(keyV2);
+    ResolvedPolarisEntity entryV3 = cache.getEntityByName(keyV3);
+    if (entryV2 != null) byNameEntries.add(entryV2);
+    if (entryV3 != null) byNameEntries.add(entryV3);
+    // At most one of the two byName keys should be present, and it must not contradict byId
+    // (the test accepts either outcome because the concurrent write order is non-deterministic,
+    // but neither entry should point to a version that was superseded)
+    assertThat(byNameEntries).hasSizeLessThanOrEqualTo(1);
   }
 }

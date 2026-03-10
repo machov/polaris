@@ -33,6 +33,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import org.apache.polaris.core.PolarisCallContext;
@@ -136,8 +137,12 @@ public class InMemoryEntityCache implements EntityCache {
     // compute name key
     EntityCacheByNameKey nameKey = new EntityCacheByNameKey(cacheEntry.getEntity());
 
-    // get old value if one exist
-    ResolvedPolarisEntity oldCacheEntry = this.byId.getIfPresent(cacheEntry.getEntity().getId());
+    // Capture the old value atomically inside the merge callback so that we always work with
+    // the entry that was actually displaced, not a separately-read (and potentially stale)
+    // snapshot. Reading the old value via a separate getIfPresent() before merge introduces a
+    // TOCTOU window: another thread may replace the entry between the read and the merge,
+    // causing us to attempt cleanup based on stale data.
+    AtomicReference<ResolvedPolarisEntity> capturedOld = new AtomicReference<>();
 
     // put new entry, only if really newer one
     this.byId
@@ -145,7 +150,10 @@ public class InMemoryEntityCache implements EntityCache {
         .merge(
             cacheEntry.getEntity().getId(),
             cacheEntry,
-            (oldValue, newValue) -> this.isNewer(newValue, oldValue) ? newValue : oldValue);
+            (oldValue, newValue) -> {
+              capturedOld.set(oldValue);
+              return this.isNewer(newValue, oldValue) ? newValue : oldValue;
+            });
 
     // only update the name key if this entity was not dropped
     if (!cacheEntry.getEntity().isDropped()) {
@@ -154,7 +162,9 @@ public class InMemoryEntityCache implements EntityCache {
       this.byName.put(nameKey, cacheEntry);
     }
 
-    // remove old name if it has changed
+    // remove old name if it has changed; use the value observed during the atomic merge so that
+    // the cleanup decision is consistent with the merge outcome rather than a stale pre-read
+    ResolvedPolarisEntity oldCacheEntry = capturedOld.get();
     if (oldCacheEntry != null) {
       // old name
       EntityCacheByNameKey oldNameKey = new EntityCacheByNameKey(oldCacheEntry.getEntity());
@@ -472,9 +482,11 @@ public class InMemoryEntityCache implements EntityCache {
       @Nonnull PolarisCallContext callCtx,
       @Nonnull PolarisEntityType entityType,
       @Nonnull List<PolarisEntityId> entityIds) {
-    // use a map to collect cached entries to avoid concurrency problems in case a second thread is
-    // trying to populate
-    // the cache from a different snapshot
+    // Use a local map to accumulate the entities resolved during this call so that the results
+    // returned to the caller form a consistent view from a single resolution attempt. This map is
+    // not a defensive copy of the shared cache; all mutations to the shared cache (byId / byName)
+    // still go through cacheNewEntry(), which uses an atomic merge to capture the displaced entry
+    // and avoid TOCTOU races during concurrent updates from different threads.
     Map<PolarisEntityId, ResolvedPolarisEntity> resolvedEntities = new HashMap<>();
     boolean stateResolved = false;
     for (int i = 0; i < MAX_CACHE_REFRESH_ATTEMPTS; i++) {

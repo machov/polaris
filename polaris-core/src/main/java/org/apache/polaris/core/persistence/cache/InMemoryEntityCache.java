@@ -142,6 +142,7 @@ public class InMemoryEntityCache implements EntityCache {
     // snapshot. Reading the old value via a separate getIfPresent() before merge introduces a
     // TOCTOU window: another thread may replace the entry between the read and the merge,
     // causing us to attempt cleanup based on stale data.
+    // See: https://github.com/apache/polaris/issues/761
     AtomicReference<ResolvedPolarisEntity> capturedOld = new AtomicReference<>();
 
     // put new entry, only if really newer one
